@@ -1,8 +1,13 @@
 import OpenAI from "openai";
+import { LangfuseClient } from "@langfuse/client";
+import { observeOpenAI } from "@langfuse/openai";
+import { observe } from "@langfuse/tracing";
 import type { ChatMessage, ChatRequest, ChatResponse } from "../shared/types";
 import { env } from "./env";
 import { getSupportContext } from "./support-data";
 import { TOOL_DEFINITIONS, executeTool } from "./tools";
+
+const langfuse = new LangfuseClient();
 
 export const SYSTEM_PROMPT = `You are Dad IT Support Agent.
 You are talking directly to Dad. He opened this chat himself to get help with his iPhone.
@@ -19,6 +24,14 @@ Rules:
 - If the request is out of scope, say so kindly and redirect to the closest iPhone-help you can give.
 - Do not invent button names or settings paths that were not confirmed by tool results.
 `;
+
+async function getPrompt() {
+  try {
+    return await langfuse.prompt.get(env.langfusePromptName);
+  } catch {
+    return null;
+  }
+}
 
 function toOpenAIMessages(
   messages: ChatMessage[]
@@ -48,14 +61,22 @@ function parseToolArguments(argumentsText: string) {
   }
 }
 
-export async function runSupportConversation(request: ChatRequest): Promise<ChatResponse> {
+async function runSupportConversationInner(request: ChatRequest): Promise<ChatResponse> {
   const context = getSupportContext();
-  const openai = new OpenAI({ apiKey: env.openaiApiKey });
+
+  const langfusePrompt = await getPrompt();
+  const systemPrompt = langfusePrompt?.prompt ?? SYSTEM_PROMPT;
+
+  const openai = observeOpenAI(
+    new OpenAI({ apiKey: env.openaiApiKey }),
+    langfusePrompt ? { langfusePrompt } : undefined
+  );
 
   const transcript: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: systemPrompt },
     ...toOpenAIMessages(request.messages)
   ];
+
   const usedTools = new Set<string>();
   let finalAnswer = "";
 
@@ -71,9 +92,13 @@ export async function runSupportConversation(request: ChatRequest): Promise<Chat
     if (!message) {
       throw new Error("OpenAI returned no assistant message.");
     }
-    transcript.push(message as OpenAI.Chat.Completions.ChatCompletionMessageParam);
+
+    transcript.push(
+      message as OpenAI.Chat.Completions.ChatCompletionMessageParam
+    );
 
     const toolCalls = message.tool_calls ?? [];
+
     if (toolCalls.length === 0) {
       finalAnswer = readAssistantText(message);
       break;
@@ -81,12 +106,24 @@ export async function runSupportConversation(request: ChatRequest): Promise<Chat
 
     for (const toolCall of toolCalls) {
       if (toolCall.type !== "function") continue;
+
       usedTools.add(toolCall.function.name);
-      const parsedArguments = parseToolArguments(toolCall.function.arguments);
+
+      const parsedArguments = parseToolArguments(
+        toolCall.function.arguments
+      );
+
       const result =
         parsedArguments === null
-          ? { ok: false, error: `The tool arguments for ${toolCall.function.name} were not valid JSON.` }
-          : await executeTool(toolCall.function.name, parsedArguments);
+          ? {
+              ok: false,
+              error: `The tool arguments for ${toolCall.function.name} were not valid JSON.`
+            }
+          : await executeTool(
+              toolCall.function.name,
+              parsedArguments
+            );
+
       transcript.push({
         role: "tool",
         tool_call_id: toolCall.id,
@@ -110,3 +147,8 @@ export async function runSupportConversation(request: ChatRequest): Promise<Chat
     }
   };
 }
+
+export const runSupportConversation = observe(runSupportConversationInner, {
+  name: "dad-it-support-chat-turn",
+  asType: "agent"
+});

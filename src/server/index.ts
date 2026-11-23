@@ -1,3 +1,10 @@
+import { NodeSDK } from "@opentelemetry/sdk-node";
+import { LangfuseSpanProcessor } from "@langfuse/otel";
+
+const langfuseSpanProcessor = new LangfuseSpanProcessor();
+const sdk = new NodeSDK({ spanProcessors: [langfuseSpanProcessor] });
+sdk.start();
+
 import "./load-env";
 import express from "express";
 import path from "node:path";
@@ -63,6 +70,8 @@ const server = app.listen(env.port, "127.0.0.1", () => {
 
 async function shutdown() {
   server.close();
+  await langfuseSpanProcessor.forceFlush();
+  await sdk.shutdown();
 }
 
 process.on("SIGINT", () => void shutdown());
